@@ -1,0 +1,197 @@
+allocator: std.mem.Allocator,
+metadata: *MetadataIndex,
+model_dir: std.fs.Dir,
+
+pub const MetadataIndex = std.StringArrayHashMapUnmanaged(Metadata);
+
+pub fn init(allocator: std.mem.Allocator, model_dir: std.fs.Dir) !@This() {
+    var weights_metadata = try allocator.create(MetadataIndex);
+    weights_metadata.* = .empty;
+    errdefer {
+        var iter = weights_metadata.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit(allocator);
+        }
+        weights_metadata.deinit(allocator);
+        allocator.destroy(weights_metadata);
+    }
+
+    // iterate over all .safetensors files
+    var dir_iter = model_dir.iterate();
+    while (try dir_iter.next()) |file_entry| {
+        const ext = std.fs.path.extension(file_entry.name);
+        if (std.mem.eql(u8, ".safetensors", ext)) {
+            const file = try model_dir.openFile(file_entry.name, .{});
+            defer {
+                file.seekTo(0) catch unreachable;
+                file.close();
+            }
+
+            var buffer: [1024]u8 = undefined;
+            var file_reader = file.reader(&buffer);
+            const reader = &file_reader.interface;
+
+            const metadata = try readMetadata(allocator, file_entry.name, reader);
+            defer allocator.free(metadata);
+            for (metadata) |item| {
+                try weights_metadata.put(allocator, try allocator.dupe(u8, item.name), item);
+            }
+        }
+    }
+
+    return @This(){
+        .allocator = allocator,
+        .metadata = weights_metadata,
+        .model_dir = model_dir,
+    };
+}
+
+pub fn deinit(self: @This()) void {
+    var metadata_iter = self.metadata.iterator();
+    while (metadata_iter.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+        entry.value_ptr.*.deinit(self.allocator);
+    }
+    self.metadata.deinit(self.allocator);
+    self.allocator.destroy(self.metadata);
+}
+
+const Metadata = struct {
+    file: []const u8,
+    name: []const u8,
+    dtype: []const u8,
+    offset: usize,
+    len: usize,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.file);
+        allocator.free(self.name);
+        allocator.free(self.dtype);
+    }
+};
+
+fn readMetadata(
+    allocator: std.mem.Allocator,
+    file: []const u8,
+    reader: *std.Io.Reader,
+) ![]const Metadata {
+    var weights_metadata: std.ArrayList(Metadata) = .empty;
+    defer weights_metadata.deinit(allocator);
+    errdefer for (weights_metadata.items) |item| item.deinit(allocator);
+
+    var header_buffer: [8]u8 = undefined;
+    try reader.readSliceAll(&header_buffer);
+    const json_size = std.mem.readInt(u64, &header_buffer, .little);
+    if (json_size > 100 * 1024 * 1024) {
+        log.err("safetensors: json header size {d} exceeds 100MB sanity limit", .{json_size});
+        return error.IOError;
+    }
+
+    const json_bytes = try reader.readAlloc(allocator, json_size);
+    defer allocator.free(json_bytes);
+
+    const metadata = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer metadata.deinit();
+
+    var metadata_iter = metadata.value.object.iterator();
+    while (metadata_iter.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const info = entry.value_ptr.*;
+
+        // Skip __metadata__ key
+        if (std.mem.eql(u8, name, "__metadata__")) continue;
+
+        // Only process tensor entries (those with data_offsets)
+        if (info != .object) continue;
+        const offsets_val = info.object.get("data_offsets") orelse continue;
+        if (offsets_val != .array) continue;
+
+        const dtype = info.object.get("dtype").?.string;
+        const offsets = offsets_val.array.items;
+        if (offsets.len < 2) continue;
+        if (offsets[0].integer < 0 or offsets[1].integer < 0) return error.IOError;
+        const offset: usize = @intCast(offsets[0].integer);
+        const end: usize = @intCast(offsets[1].integer);
+        if (end < offset) return error.IOError;
+        const len = end - offset;
+
+        const file_dup = try allocator.dupe(u8, file);
+        errdefer allocator.free(file_dup);
+        const name_dup = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_dup);
+        const dtype_dup = try allocator.dupe(u8, dtype);
+        errdefer allocator.free(dtype_dup);
+
+        try weights_metadata.append(allocator, .{
+            .file = file_dup,
+            .name = name_dup,
+            .dtype = dtype_dup,
+            .offset = std.math.add(usize, std.math.add(usize, offset, 8) catch return error.IOError, @intCast(json_size)) catch return error.IOError,
+            .len = len,
+        });
+    }
+
+    return try weights_metadata.toOwnedSlice(allocator);
+}
+
+/// Read a tensor by name, returning its raw data and type. Returns null if not found.
+pub fn getTensor(self: *@This(), name: []const u8) !?Tensor {
+    const meta = self.metadata.get(name) orelse return null;
+
+    const file = self.model_dir.openFile(meta.file, .{}) catch {
+        log.err("safetensors: failed to open '{s}' for tensor '{s}'", .{ meta.file, name });
+        return error.IOError;
+    };
+    defer file.close();
+
+    var buffer: [4 * 1024]u8 = undefined;
+    var file_reader = file.reader(&buffer);
+    const reader = &file_reader.interface;
+
+    _ = reader.discard(.limited(meta.offset)) catch {
+        log.err("safetensors: failed to seek to tensor '{s}' in '{s}'", .{ name, meta.file });
+        return error.IOError;
+    };
+
+    const raw_data = reader.readAlloc(self.allocator, meta.len) catch {
+        log.err("safetensors: failed to read tensor '{s}' ({d} bytes) from '{s}'", .{ name, meta.len, meta.file });
+        return error.IOError;
+    };
+
+    const data_type: Tensor.DataType = .fromString(meta.dtype);
+
+    return Tensor{
+        .data_type = data_type,
+        .data = raw_data,
+    };
+}
+
+/// Free a tensor previously returned by getTensor.
+pub fn releaseTensor(self: *@This(), tensor: ?Tensor) void {
+    if (tensor) |tens| tens.deinit(self.allocator);
+}
+
+test {
+    const path = "test_models/TinyStories-656K";
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+
+    var sf = try init(testing.allocator, dir);
+    defer sf.deinit();
+
+    const embeddings = try sf.getTensor("model.embed_tokens.weight");
+    defer sf.releaseTensor(embeddings);
+
+    const embeddings_f32 = try embeddings.?.toF32(testing.allocator);
+    defer testing.allocator.free(embeddings_f32);
+
+    try testing.expectEqual(embeddings.?.data.len, embeddings_f32.len * 2);
+}
+
+const Tensor = @import("base").Tensor;
+
+const log = std.log.scoped(.infer);
+
+const std = @import("std");
+const testing = std.testing;
