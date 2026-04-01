@@ -431,7 +431,7 @@ fn freePostProcessor(allocator: std.mem.Allocator, post_processor: Vocabulary.Po
     }
 }
 
-test {
+test "load tokenizer.json and verify vocabulary" {
     const tokenizer_file = try std.fs.cwd().openFile("test_models/TinyStories-656K/tokenizer.json", .{});
     defer tokenizer_file.close();
 
@@ -442,6 +442,8 @@ test {
 
     try testing.expectEqual(26, vocabulary.encoding.get("A").?);
     try testing.expectEqualStrings("A", vocabulary.decoding.get(26).?);
+    try testing.expect(vocabulary.special_tokens.count() > 0);
+    try testing.expect(vocabulary.merge_index.count() > 0);
 }
 
 const Vocabulary = @import("base").Vocabulary;

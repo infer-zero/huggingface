@@ -172,7 +172,18 @@ pub fn releaseTensor(self: *@This(), tensor: ?Tensor) void {
     if (tensor) |tens| tens.deinit(self.allocator);
 }
 
-test {
+test "init loads safetensors metadata" {
+    const path = "test_models/TinyStories-656K";
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+
+    var sf = try init(testing.allocator, dir);
+    defer sf.deinit();
+
+    try testing.expect(sf.metadata.count() > 0);
+}
+
+test "getTensor loads and dequantizes embeddings" {
     const path = "test_models/TinyStories-656K";
     var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
     defer dir.close();
@@ -183,10 +194,24 @@ test {
     const embeddings = try sf.getTensor("model.embed_tokens.weight");
     defer sf.releaseTensor(embeddings);
 
+    try testing.expect(embeddings != null);
+
     const embeddings_f32 = try embeddings.?.toF32(testing.allocator);
     defer testing.allocator.free(embeddings_f32);
 
     try testing.expectEqual(embeddings.?.data.len, embeddings_f32.len * 2);
+}
+
+test "getTensor returns null for missing tensor" {
+    const path = "test_models/TinyStories-656K";
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+
+    var sf = try init(testing.allocator, dir);
+    defer sf.deinit();
+
+    const missing = try sf.getTensor("nonexistent.weight");
+    try testing.expect(missing == null);
 }
 
 const Tensor = @import("base").Tensor;
