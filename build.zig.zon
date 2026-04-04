@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .infer_base = .{
-            .url = "git+https://github.com/infer-zero/base#5d437343ca3a1553fb1f5b5c7abd255241b70382",
-            .hash = "infer_base-0.1.0-cgr38sXkAABeUdTtV9uY1Cn5RtOTKZaSxCl77sqBFTLs",
+            .url = "git+https://github.com/infer-zero/base#3984600e5ba53ee63a3b910c9c9b3ef8ca9f8cc7",
+            .hash = "infer_base-0.1.0-cgr38o70AACwNvVxFMfiJ-RppKQ7SI8MQ292b10rDu05",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
