@@ -1,9 +1,9 @@
 pub const Safetensors = @import("safetensors.zig");
 pub const HfTokenizer = @import("tokenizer.zig");
-pub const download = @import("download.zig");
+pub const json_config = @import("json_config.zig");
 
 test {
     _ = Safetensors;
     _ = HfTokenizer;
-    _ = download;
+    _ = json_config;
 }
