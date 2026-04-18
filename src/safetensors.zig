@@ -135,6 +135,67 @@ fn readMetadata(
     return try weights_metadata.toOwnedSlice(allocator);
 }
 
+/// Parser-native data-type enum. Mirrors `base.Tensor.DataType` numerically
+/// so conversions between the two are a `@bitCast` away. Phase 6 will remove
+/// huggingface's dependency on base; callers will then route through
+/// `getTensorRaw` + a harness adapter that wraps the raw bytes.
+pub const DataType = enum(u8) {
+    BF16 = 0,
+    FP32 = 1,
+    FP16 = 2,
+    Q8_0 = 3,
+    Q4_0 = 4,
+    Q6_K = 5,
+    Q4_1 = 6,
+    Q5_0 = 7,
+    Q4_K = 8,
+    Q5_K = 9,
+    _,
+
+    pub fn fromString(dtype_str: []const u8) @This() {
+        return std.meta.stringToEnum(@This(), dtype_str) orelse .BF16;
+    }
+};
+
+/// Minimal parser-native tensor view: just the raw bytes plus the dtype.
+/// No conversion methods, no dependency on base.
+pub const RawTensor = struct {
+    data_type: DataType,
+    data: []const u8,
+};
+
+/// Raw-bytes counterpart to `getTensor`. Returns the tensor's on-disk bytes
+/// plus its native `DataType` — no dependency on base. Caller owns the
+/// returned buffer (free with `allocator.free(raw.data)`).
+pub fn getTensorRaw(self: *@This(), name: []const u8) !?RawTensor {
+    const meta = self.metadata.get(name) orelse return null;
+
+    const file = self.model_dir.openFile(meta.file, .{}) catch {
+        log.err("safetensors: failed to open '{s}' for tensor '{s}'", .{ meta.file, name });
+        return error.IOError;
+    };
+    defer file.close();
+
+    var buffer: [4 * 1024]u8 = undefined;
+    var file_reader = file.reader(&buffer);
+    const reader = &file_reader.interface;
+
+    _ = reader.discard(.limited(meta.offset)) catch {
+        log.err("safetensors: failed to seek to tensor '{s}' in '{s}'", .{ name, meta.file });
+        return error.IOError;
+    };
+
+    const raw_data = reader.readAlloc(self.allocator, meta.len) catch {
+        log.err("safetensors: failed to read tensor '{s}' ({d} bytes) from '{s}'", .{ name, meta.len, meta.file });
+        return error.IOError;
+    };
+
+    return .{
+        .data_type = DataType.fromString(meta.dtype),
+        .data = raw_data,
+    };
+}
+
 /// Read a tensor by name, returning its raw data and type. Returns null if not found.
 pub fn getTensor(self: *@This(), name: []const u8) !?Tensor {
     const meta = self.metadata.get(name) orelse return null;
