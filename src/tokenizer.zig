@@ -2,9 +2,9 @@ const Self = @This();
 const Parsed = std.json.Parsed(std.json.Value);
 
 allocator: std.mem.Allocator,
-vocabulary_ptr: *Vocabulary,
+parsed_tokenizer_ptr: *ParsedTokenizer,
 
-vocabulary: Vocabulary,
+parsed_tokenizer: ParsedTokenizer,
 
 pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
     const json_bytes = try tokenizer_file.readToEndAlloc(allocator, 128 * 1024 * 1024);
@@ -15,14 +15,14 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
 
     const data = parsed.value;
 
-    var encoding: Vocabulary.EncodingVocabulary = .empty;
+    var encoding: ParsedTokenizer.EncodingMap = .empty;
     errdefer {
         var enc_it = encoding.iterator();
         while (enc_it.next()) |entry| allocator.free(entry.key_ptr.*);
         encoding.deinit(allocator);
     }
 
-    var decoding: Vocabulary.DecodingVocabulary = .empty;
+    var decoding: ParsedTokenizer.DecodingMap = .empty;
     errdefer {
         var dec_it = decoding.iterator();
         while (dec_it.next()) |entry| allocator.free(entry.value_ptr.*);
@@ -42,7 +42,7 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
     errdefer if (unknown_token) |unk| allocator.free(unk);
 
     // Build merge pair index: "left\x00right" -> merge_idx
-    var merge_index: Vocabulary.MergePairIndex = .{};
+    var merge_index: ParsedTokenizer.MergePairIndex = .{};
     errdefer {
         var merge_it = merge_index.iterator();
         while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
@@ -105,7 +105,7 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
         try decoding.put(allocator, token_id, decoded_token);
     }
 
-    var special_tokens: Vocabulary.SpecialTokens = .empty;
+    var special_tokens: ParsedTokenizer.SpecialTokenMap = .empty;
     errdefer {
         var sp_it = special_tokens.iterator();
         while (sp_it.next()) |entry| allocator.free(entry.key_ptr.*);
@@ -125,19 +125,24 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
             try decoding.put(allocator, token_id, dec_token);
         }
 
-        const is_special = if (token.object.get("special")) |special_val| special_val == .bool and special_val.bool else false;
-        if (is_special) {
-            const sp_key = try allocator.dupe(u8, content);
-            try special_tokens.put(allocator, sp_key, token_id);
-        }
+        // Add ALL added_tokens to special_tokens (used to build special_tokens_sorted,
+        // which the encoder splits on). The "special" flag in tokenizer.json is a
+        // *decode-time* concern (whether to skip when skip_special_tokens=True),
+        // NOT an encode-time concern. HF's tokenizer treats every added_token as
+        // atomic during encoding regardless. Skipping non-special added tokens here
+        // causes Qwen3-style architectures to BPE-split tokens like `<think>`,
+        // `<tool_call>`, etc. into sub-tokens, which produces a token sequence the
+        // model never saw during training.
+        const sp_key = try allocator.dupe(u8, content);
+        try special_tokens.put(allocator, sp_key, token_id);
     }
 
     // Build sorted special tokens list (longest first for greedy matching)
     const special_tokens_sorted = blk: {
         const sp_count = special_tokens.count();
-        if (sp_count == 0) break :blk &[_]Vocabulary.SpecialTokenEntry{};
+        if (sp_count == 0) break :blk &[_]ParsedTokenizer.SpecialTokenEntry{};
 
-        const sorted = try allocator.alloc(Vocabulary.SpecialTokenEntry, sp_count);
+        const sorted = try allocator.alloc(ParsedTokenizer.SpecialTokenEntry, sp_count);
         errdefer allocator.free(sorted);
 
         var sp_iter = special_tokens.iterator();
@@ -146,8 +151,8 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
             sorted[index] = .{ .text = entry.key_ptr.*, .id = entry.value_ptr.* };
         }
 
-        std.mem.sort(Vocabulary.SpecialTokenEntry, sorted, {}, struct {
-            fn lessThan(_: void, lhs: Vocabulary.SpecialTokenEntry, rhs: Vocabulary.SpecialTokenEntry) bool {
+        std.mem.sort(ParsedTokenizer.SpecialTokenEntry, sorted, {}, struct {
+            fn lessThan(_: void, lhs: ParsedTokenizer.SpecialTokenEntry, rhs: ParsedTokenizer.SpecialTokenEntry) bool {
                 // Sort by length descending (longer tokens first for greedy match)
                 return lhs.text.len > rhs.text.len;
             }
@@ -191,8 +196,8 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
         break :blk false;
     };
 
-    const vocab = try allocator.create(Vocabulary);
-    vocab.* = .{
+    const tok = try allocator.create(ParsedTokenizer);
+    tok.* = .{
         .decoding = decoding,
         .encoding = encoding,
         .merge_index = merge_index,
@@ -206,56 +211,56 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
 
     return Self{
         .allocator = allocator,
-        .vocabulary_ptr = vocab,
-        .vocabulary = vocab.*,
+        .parsed_tokenizer_ptr = tok,
+        .parsed_tokenizer = tok.*,
     };
 }
 
 pub fn deinit(self: Self) void {
-    // Free encoding vocabulary keys
-    var enc_iter = self.vocabulary_ptr.encoding.iterator();
+    // Free encoding keys
+    var enc_iter = self.parsed_tokenizer_ptr.encoding.iterator();
     while (enc_iter.next()) |entry| {
         self.allocator.free(entry.key_ptr.*);
     }
-    self.vocabulary_ptr.encoding.deinit(self.allocator);
+    self.parsed_tokenizer_ptr.encoding.deinit(self.allocator);
 
-    // Free decoding vocabulary values
-    var dec_iter = self.vocabulary_ptr.decoding.iterator();
+    // Free decoding values
+    var dec_iter = self.parsed_tokenizer_ptr.decoding.iterator();
     while (dec_iter.next()) |entry| {
         self.allocator.free(entry.value_ptr.*);
     }
-    self.vocabulary_ptr.decoding.deinit(self.allocator);
+    self.parsed_tokenizer_ptr.decoding.deinit(self.allocator);
 
     // Free merge index keys
-    var merge_idx_iter = self.vocabulary_ptr.merge_index.iterator();
+    var merge_idx_iter = self.parsed_tokenizer_ptr.merge_index.iterator();
     while (merge_idx_iter.next()) |entry| {
         self.allocator.free(entry.key_ptr.*);
     }
-    self.vocabulary_ptr.merge_index.deinit(self.allocator);
+    self.parsed_tokenizer_ptr.merge_index.deinit(self.allocator);
 
-    if (self.vocabulary_ptr.unknown_token) |unk| {
+    if (self.parsed_tokenizer_ptr.unknown_token) |unk| {
         self.allocator.free(unk);
     }
 
-    if (self.vocabulary_ptr.normalizer) |normalizer| {
+    if (self.parsed_tokenizer_ptr.normalizer) |normalizer| {
         freeNormalizer(self.allocator, normalizer);
     }
 
-    if (self.vocabulary_ptr.post_processor) |post_processor| {
+    if (self.parsed_tokenizer_ptr.post_processor) |post_processor| {
         freePostProcessor(self.allocator, post_processor);
     }
 
     // Free special tokens
-    var sp_iter = self.vocabulary_ptr.special_tokens.iterator();
+    var sp_iter = self.parsed_tokenizer_ptr.special_tokens.iterator();
     while (sp_iter.next()) |entry| {
         self.allocator.free(entry.key_ptr.*);
     }
-    self.vocabulary_ptr.special_tokens.deinit(self.allocator);
-    if (self.vocabulary_ptr.special_tokens_sorted.len > 0) {
-        self.allocator.free(self.vocabulary_ptr.special_tokens_sorted);
+    self.parsed_tokenizer_ptr.special_tokens.deinit(self.allocator);
+    if (self.parsed_tokenizer_ptr.special_tokens_sorted.len > 0) {
+        self.allocator.free(self.parsed_tokenizer_ptr.special_tokens_sorted);
     }
 
-    self.allocator.destroy(self.vocabulary_ptr);
+    self.allocator.destroy(self.parsed_tokenizer_ptr);
 }
 
 fn decodeRawToken(allocator: std.mem.Allocator, raw_token: []const u8) ![]const u8 {
@@ -276,17 +281,17 @@ fn decodeRawToken(allocator: std.mem.Allocator, raw_token: []const u8) ![]const 
     return allocator.dupe(u8, raw_token);
 }
 
-fn readNormalizer(allocator: std.mem.Allocator, data: std.json.Value) !?Vocabulary.Normalizer {
+fn readNormalizer(allocator: std.mem.Allocator, data: std.json.Value) !?ParsedTokenizer.Normalizer {
     const v_normalizer = data.object.get("normalizer") orelse return null;
     if (v_normalizer == .null) return null;
     return try readNormalizerValue(allocator, v_normalizer);
 }
 
-fn readNormalizerValue(allocator: std.mem.Allocator, v_normalizer: std.json.Value) !?Vocabulary.Normalizer {
+fn readNormalizerValue(allocator: std.mem.Allocator, v_normalizer: std.json.Value) !?ParsedTokenizer.Normalizer {
     const n_type = try getString(v_normalizer, "type");
 
     if (std.ascii.eqlIgnoreCase("Sequence", n_type)) {
-        var result: std.ArrayListUnmanaged(Vocabulary.Normalizer) = .{};
+        var result: std.ArrayListUnmanaged(ParsedTokenizer.Normalizer) = .{};
         defer result.deinit(allocator);
 
         const normalizers = try getArray(v_normalizer, "normalizers");
@@ -318,8 +323,8 @@ fn readNormalizerValue(allocator: std.mem.Allocator, v_normalizer: std.json.Valu
 fn readPostProcessor(
     allocator: std.mem.Allocator,
     data: std.json.Value,
-    encoding: *Vocabulary.EncodingVocabulary,
-) !?Vocabulary.PostProcessor {
+    encoding: *ParsedTokenizer.EncodingMap,
+) !?ParsedTokenizer.PostProcessor {
     const v_post = data.object.get("post_processor") orelse return null;
     if (v_post == .null) return null;
     return try readPostProcessorValue(allocator, v_post, encoding);
@@ -328,12 +333,12 @@ fn readPostProcessor(
 fn readPostProcessorValue(
     allocator: std.mem.Allocator,
     v_post: std.json.Value,
-    encoding: *Vocabulary.EncodingVocabulary,
-) !?Vocabulary.PostProcessor {
+    encoding: *ParsedTokenizer.EncodingMap,
+) !?ParsedTokenizer.PostProcessor {
     const post_type = try getString(v_post, "type");
 
     if (std.ascii.eqlIgnoreCase("Sequence", post_type)) {
-        var result: std.ArrayListUnmanaged(Vocabulary.PostProcessor) = .{};
+        var result: std.ArrayListUnmanaged(ParsedTokenizer.PostProcessor) = .{};
         defer result.deinit(allocator);
 
         const processors = try getArray(v_post, "processors");
@@ -345,7 +350,7 @@ fn readPostProcessorValue(
 
         return .{ .sequence = try result.toOwnedSlice(allocator) };
     } else if (std.ascii.eqlIgnoreCase("TemplateProcessing", post_type)) {
-        var template: std.ArrayListUnmanaged(Vocabulary.PostProcessor.TemplateProcessing) = .{};
+        var template: std.ArrayListUnmanaged(ParsedTokenizer.PostProcessor.TemplateProcessing) = .{};
         defer template.deinit(allocator);
 
         const single = try getArray(v_post, "single");
@@ -407,7 +412,7 @@ fn getArray(json_val: std.json.Value, key: []const u8) ![]const std.json.Value {
     return val.array.items;
 }
 
-fn freeNormalizer(allocator: std.mem.Allocator, normalizer: Vocabulary.Normalizer) void {
+fn freeNormalizer(allocator: std.mem.Allocator, normalizer: ParsedTokenizer.Normalizer) void {
     switch (normalizer) {
         .sequence => |seq| {
             for (seq) |norm| freeNormalizer(allocator, norm);
@@ -421,7 +426,7 @@ fn freeNormalizer(allocator: std.mem.Allocator, normalizer: Vocabulary.Normalize
     }
 }
 
-fn freePostProcessor(allocator: std.mem.Allocator, post_processor: Vocabulary.PostProcessor) void {
+fn freePostProcessor(allocator: std.mem.Allocator, post_processor: ParsedTokenizer.PostProcessor) void {
     switch (post_processor) {
         .sequence => |seq| {
             for (seq) |processor| freePostProcessor(allocator, processor);
@@ -438,15 +443,60 @@ test "load tokenizer.json and verify vocabulary" {
     const tokenizer = try init(testing.allocator, tokenizer_file);
     defer tokenizer.deinit();
 
-    const vocabulary = tokenizer.vocabulary;
+    const tok = tokenizer.parsed_tokenizer;
 
-    try testing.expectEqual(26, vocabulary.encoding.get("A").?);
-    try testing.expectEqualStrings("A", vocabulary.decoding.get(26).?);
-    try testing.expect(vocabulary.special_tokens.count() > 0);
-    try testing.expect(vocabulary.merge_index.count() > 0);
+    try testing.expectEqual(26, tok.encoding.get("A").?);
+    try testing.expectEqualStrings("A", tok.decoding.get(26).?);
+    try testing.expect(tok.special_tokens.count() > 0);
+    try testing.expect(tok.merge_index.count() > 0);
 }
 
-const Vocabulary = @import("base").Vocabulary;
+/// Parser-native tokenizer data extracted from a HuggingFace `tokenizer.json`.
+/// All strings and hashmap keys are owned by the parser's allocator. Phase 6b
+/// moved this out of `base.Vocabulary` so the parser no longer depends on
+/// base; `harness/src/adapters.zig::vocabularyOwned` builds a fresh
+/// `base.Vocabulary` from this struct on demand.
+pub const ParsedTokenizer = struct {
+    encoding: EncodingMap,
+    decoding: DecodingMap,
+    merge_index: MergePairIndex,
+    special_tokens: SpecialTokenMap = .empty,
+    special_tokens_sorted: []const SpecialTokenEntry = &.{},
+    unknown_token: ?[]const u8 = null,
+    normalizer: ?Normalizer = null,
+    post_processor: ?PostProcessor = null,
+    use_byte_level: bool = false,
+
+    pub const TokenID = u32;
+    pub const EncodingMap = std.StringHashMapUnmanaged(TokenID);
+    pub const DecodingMap = std.AutoHashMapUnmanaged(TokenID, []const u8);
+    pub const MergePairIndex = std.StringHashMapUnmanaged(usize);
+    pub const SpecialTokenMap = std.StringHashMapUnmanaged(TokenID);
+
+    pub const SpecialTokenEntry = struct {
+        text: []const u8,
+        id: TokenID,
+    };
+
+    pub const Normalizer = union(enum) {
+        sequence: []const Normalizer,
+        prepend: []const u8,
+        replace: struct {
+            pattern: []const u8,
+            content: []const u8,
+        },
+    };
+
+    pub const PostProcessor = union(enum) {
+        sequence: []const PostProcessor,
+        template: []const TemplateProcessing,
+
+        pub const TemplateProcessing = union(enum) {
+            sequence: void,
+            special_token: TokenID,
+        };
+    };
+};
 
 const log = std.log.scoped(.infer);
 
