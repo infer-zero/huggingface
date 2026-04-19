@@ -136,9 +136,7 @@ fn readMetadata(
 }
 
 /// Parser-native data-type enum. Mirrors `base.Tensor.DataType` numerically
-/// so conversions between the two are a `@bitCast` away. Phase 6 will remove
-/// huggingface's dependency on base; callers will then route through
-/// `getTensorRaw` + a harness adapter that wraps the raw bytes.
+/// so the harness adapter's `rawToTensor` conversion is a single enum cast.
 pub const DataType = enum(u8) {
     BF16 = 0,
     FP32 = 1,

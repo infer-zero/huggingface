@@ -2,8 +2,6 @@ const Self = @This();
 const Parsed = std.json.Parsed(std.json.Value);
 
 allocator: std.mem.Allocator,
-parsed_tokenizer_ptr: *ParsedTokenizer,
-
 parsed_tokenizer: ParsedTokenizer,
 
 pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
@@ -196,71 +194,47 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !Self {
         break :blk false;
     };
 
-    const tok = try allocator.create(ParsedTokenizer);
-    tok.* = .{
-        .decoding = decoding,
-        .encoding = encoding,
-        .merge_index = merge_index,
-        .unknown_token = unknown_token,
-        .normalizer = normalizer,
-        .post_processor = post_processor,
-        .use_byte_level = use_byte_level,
-        .special_tokens = special_tokens,
-        .special_tokens_sorted = special_tokens_sorted,
-    };
-
     return Self{
         .allocator = allocator,
-        .parsed_tokenizer_ptr = tok,
-        .parsed_tokenizer = tok.*,
+        .parsed_tokenizer = .{
+            .decoding = decoding,
+            .encoding = encoding,
+            .merge_index = merge_index,
+            .unknown_token = unknown_token,
+            .normalizer = normalizer,
+            .post_processor = post_processor,
+            .use_byte_level = use_byte_level,
+            .special_tokens = special_tokens,
+            .special_tokens_sorted = special_tokens_sorted,
+        },
     };
 }
 
-pub fn deinit(self: Self) void {
-    // Free encoding keys
-    var enc_iter = self.parsed_tokenizer_ptr.encoding.iterator();
-    while (enc_iter.next()) |entry| {
-        self.allocator.free(entry.key_ptr.*);
-    }
-    self.parsed_tokenizer_ptr.encoding.deinit(self.allocator);
+pub fn deinit(self: *Self) void {
+    const tok = &self.parsed_tokenizer;
 
-    // Free decoding values
-    var dec_iter = self.parsed_tokenizer_ptr.decoding.iterator();
-    while (dec_iter.next()) |entry| {
-        self.allocator.free(entry.value_ptr.*);
-    }
-    self.parsed_tokenizer_ptr.decoding.deinit(self.allocator);
+    var enc_iter = tok.encoding.iterator();
+    while (enc_iter.next()) |entry| self.allocator.free(entry.key_ptr.*);
+    tok.encoding.deinit(self.allocator);
 
-    // Free merge index keys
-    var merge_idx_iter = self.parsed_tokenizer_ptr.merge_index.iterator();
-    while (merge_idx_iter.next()) |entry| {
-        self.allocator.free(entry.key_ptr.*);
-    }
-    self.parsed_tokenizer_ptr.merge_index.deinit(self.allocator);
+    var dec_iter = tok.decoding.iterator();
+    while (dec_iter.next()) |entry| self.allocator.free(entry.value_ptr.*);
+    tok.decoding.deinit(self.allocator);
 
-    if (self.parsed_tokenizer_ptr.unknown_token) |unk| {
-        self.allocator.free(unk);
-    }
+    var merge_idx_iter = tok.merge_index.iterator();
+    while (merge_idx_iter.next()) |entry| self.allocator.free(entry.key_ptr.*);
+    tok.merge_index.deinit(self.allocator);
 
-    if (self.parsed_tokenizer_ptr.normalizer) |normalizer| {
-        freeNormalizer(self.allocator, normalizer);
-    }
+    if (tok.unknown_token) |unk| self.allocator.free(unk);
+    if (tok.normalizer) |normalizer| freeNormalizer(self.allocator, normalizer);
+    if (tok.post_processor) |post_processor| freePostProcessor(self.allocator, post_processor);
 
-    if (self.parsed_tokenizer_ptr.post_processor) |post_processor| {
-        freePostProcessor(self.allocator, post_processor);
+    var sp_iter = tok.special_tokens.iterator();
+    while (sp_iter.next()) |entry| self.allocator.free(entry.key_ptr.*);
+    tok.special_tokens.deinit(self.allocator);
+    if (tok.special_tokens_sorted.len > 0) {
+        self.allocator.free(tok.special_tokens_sorted);
     }
-
-    // Free special tokens
-    var sp_iter = self.parsed_tokenizer_ptr.special_tokens.iterator();
-    while (sp_iter.next()) |entry| {
-        self.allocator.free(entry.key_ptr.*);
-    }
-    self.parsed_tokenizer_ptr.special_tokens.deinit(self.allocator);
-    if (self.parsed_tokenizer_ptr.special_tokens_sorted.len > 0) {
-        self.allocator.free(self.parsed_tokenizer_ptr.special_tokens_sorted);
-    }
-
-    self.allocator.destroy(self.parsed_tokenizer_ptr);
 }
 
 fn decodeRawToken(allocator: std.mem.Allocator, raw_token: []const u8) ![]const u8 {
@@ -440,7 +414,7 @@ test "load tokenizer.json and verify vocabulary" {
     const tokenizer_file = try std.fs.cwd().openFile("test_models/TinyStories-656K/tokenizer.json", .{});
     defer tokenizer_file.close();
 
-    const tokenizer = try init(testing.allocator, tokenizer_file);
+    var tokenizer = try init(testing.allocator, tokenizer_file);
     defer tokenizer.deinit();
 
     const tok = tokenizer.parsed_tokenizer;
@@ -452,9 +426,8 @@ test "load tokenizer.json and verify vocabulary" {
 }
 
 /// Parser-native tokenizer data extracted from a HuggingFace `tokenizer.json`.
-/// All strings and hashmap keys are owned by the parser's allocator. Phase 6b
-/// moved this out of `base.Vocabulary` so the parser no longer depends on
-/// base; `harness/src/adapters.zig::vocabularyOwned` builds a fresh
+/// All strings and hashmap keys are owned by the parser's allocator.
+/// `harness/src/adapters.zig::vocabularyOwned` builds a fresh
 /// `base.Vocabulary` from this struct on demand.
 pub const ParsedTokenizer = struct {
     encoding: EncodingMap,
