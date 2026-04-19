@@ -196,43 +196,6 @@ pub fn getTensorRaw(self: *@This(), name: []const u8) !?RawTensor {
     };
 }
 
-/// Read a tensor by name, returning its raw data and type. Returns null if not found.
-pub fn getTensor(self: *@This(), name: []const u8) !?Tensor {
-    const meta = self.metadata.get(name) orelse return null;
-
-    const file = self.model_dir.openFile(meta.file, .{}) catch {
-        log.err("safetensors: failed to open '{s}' for tensor '{s}'", .{ meta.file, name });
-        return error.IOError;
-    };
-    defer file.close();
-
-    var buffer: [4 * 1024]u8 = undefined;
-    var file_reader = file.reader(&buffer);
-    const reader = &file_reader.interface;
-
-    _ = reader.discard(.limited(meta.offset)) catch {
-        log.err("safetensors: failed to seek to tensor '{s}' in '{s}'", .{ name, meta.file });
-        return error.IOError;
-    };
-
-    const raw_data = reader.readAlloc(self.allocator, meta.len) catch {
-        log.err("safetensors: failed to read tensor '{s}' ({d} bytes) from '{s}'", .{ name, meta.len, meta.file });
-        return error.IOError;
-    };
-
-    const data_type: Tensor.DataType = .fromString(meta.dtype);
-
-    return Tensor{
-        .data_type = data_type,
-        .data = raw_data,
-    };
-}
-
-/// Free a tensor previously returned by getTensor.
-pub fn releaseTensor(self: *@This(), tensor: ?Tensor) void {
-    if (tensor) |tens| tens.deinit(self.allocator);
-}
-
 test "init loads safetensors metadata" {
     const path = "test_models/TinyStories-656K";
     var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
@@ -244,7 +207,7 @@ test "init loads safetensors metadata" {
     try testing.expect(sf.metadata.count() > 0);
 }
 
-test "getTensor loads and dequantizes embeddings" {
+test "getTensorRaw loads embeddings" {
     const path = "test_models/TinyStories-656K";
     var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
     defer dir.close();
@@ -252,18 +215,17 @@ test "getTensor loads and dequantizes embeddings" {
     var sf = try init(testing.allocator, dir);
     defer sf.deinit();
 
-    const embeddings = try sf.getTensor("model.embed_tokens.weight");
-    defer sf.releaseTensor(embeddings);
-
+    const embeddings = try sf.getTensorRaw("model.embed_tokens.weight");
     try testing.expect(embeddings != null);
+    const raw = embeddings.?;
+    defer testing.allocator.free(raw.data);
 
-    const embeddings_f32 = try embeddings.?.toF32(testing.allocator);
-    defer testing.allocator.free(embeddings_f32);
-
-    try testing.expectEqual(embeddings.?.data.len, embeddings_f32.len * 2);
+    try testing.expectEqual(DataType.BF16, raw.data_type);
+    try testing.expect(raw.data.len > 0);
+    try testing.expectEqual(@as(usize, 0), raw.data.len % 2);
 }
 
-test "getTensor returns null for missing tensor" {
+test "getTensorRaw returns null for missing tensor" {
     const path = "test_models/TinyStories-656K";
     var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
     defer dir.close();
@@ -271,11 +233,9 @@ test "getTensor returns null for missing tensor" {
     var sf = try init(testing.allocator, dir);
     defer sf.deinit();
 
-    const missing = try sf.getTensor("nonexistent.weight");
+    const missing = try sf.getTensorRaw("nonexistent.weight");
     try testing.expect(missing == null);
 }
-
-const Tensor = @import("base").Tensor;
 
 const log = std.log.scoped(.infer);
 
