@@ -1,21 +1,16 @@
 allocator: std.mem.Allocator,
-metadata: *MetadataIndex,
+metadata: MetadataIndex,
 model_dir: std.fs.Dir,
 
 pub const MetadataIndex = std.StringArrayHashMapUnmanaged(Metadata);
 
 pub fn init(allocator: std.mem.Allocator, model_dir: std.fs.Dir) !@This() {
-    var weights_metadata = try allocator.create(MetadataIndex);
-    weights_metadata.* = .empty;
-    errdefer {
-        var iter = weights_metadata.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.*.deinit(allocator);
-        }
-        weights_metadata.deinit(allocator);
-        allocator.destroy(weights_metadata);
-    }
+    var self: @This() = .{
+        .allocator = allocator,
+        .metadata = .empty,
+        .model_dir = model_dir,
+    };
+    errdefer self.deinit();
 
     // iterate over all .safetensors files
     var dir_iter = model_dir.iterate();
@@ -35,26 +30,21 @@ pub fn init(allocator: std.mem.Allocator, model_dir: std.fs.Dir) !@This() {
             const metadata = try readMetadata(allocator, file_entry.name, reader);
             defer allocator.free(metadata);
             for (metadata) |item| {
-                try weights_metadata.put(allocator, try allocator.dupe(u8, item.name), item);
+                try self.metadata.put(allocator, try allocator.dupe(u8, item.name), item);
             }
         }
     }
 
-    return @This(){
-        .allocator = allocator,
-        .metadata = weights_metadata,
-        .model_dir = model_dir,
-    };
+    return self;
 }
 
-pub fn deinit(self: @This()) void {
+pub fn deinit(self: *@This()) void {
     var metadata_iter = self.metadata.iterator();
     while (metadata_iter.next()) |entry| {
         self.allocator.free(entry.key_ptr.*);
         entry.value_ptr.*.deinit(self.allocator);
     }
     self.metadata.deinit(self.allocator);
-    self.allocator.destroy(self.metadata);
 }
 
 const Metadata = struct {
@@ -80,9 +70,7 @@ fn readMetadata(
     defer weights_metadata.deinit(allocator);
     errdefer for (weights_metadata.items) |item| item.deinit(allocator);
 
-    var header_buffer: [8]u8 = undefined;
-    try reader.readSliceAll(&header_buffer);
-    const json_size = std.mem.readInt(u64, &header_buffer, .little);
+    const json_size = try reader.takeInt(u64, .little);
     if (json_size > 100 * 1024 * 1024) {
         log.err("safetensors: json header size {d} exceeds 100MB sanity limit", .{json_size});
         return error.IOError;
@@ -135,7 +123,7 @@ fn readMetadata(
     return try weights_metadata.toOwnedSlice(allocator);
 }
 
-/// Parser-native data-type enum. Mirrors `base.Tensor.DataType` numerically
+/// Parser-native data-type enum. Mirrors `runtime.Tensor.DataType` numerically
 /// so the harness adapter's `rawToTensor` conversion is a single enum cast.
 pub const DataType = enum(u8) {
     BF16 = 0,
@@ -156,14 +144,14 @@ pub const DataType = enum(u8) {
 };
 
 /// Minimal parser-native tensor view: just the raw bytes plus the dtype.
-/// No conversion methods, no dependency on base.
+/// No conversion methods, no dependency on runtime.
 pub const RawTensor = struct {
     data_type: DataType,
     data: []const u8,
 };
 
 /// Raw-bytes counterpart to `getTensor`. Returns the tensor's on-disk bytes
-/// plus its native `DataType` — no dependency on base. Caller owns the
+/// plus its native `DataType` — no dependency on runtime. Caller owns the
 /// returned buffer (free with `allocator.free(raw.data)`).
 pub fn getTensorRaw(self: *@This(), name: []const u8) !?RawTensor {
     const meta = self.metadata.get(name) orelse return null;

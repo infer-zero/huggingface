@@ -18,4 +18,12 @@ pub fn getFloat(obj: std.json.ObjectMap, key: []const u8) ?f32 {
     };
 }
 
+pub fn getBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .bool => |v| v,
+        else => null,
+    };
+}
+
 const std = @import("std");
