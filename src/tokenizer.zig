@@ -39,10 +39,7 @@ pub const PostProcessor = union(enum) {
 
 const Parsed = std.json.Parsed(std.json.Value);
 
-pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !@This() {
-    const json_bytes = try tokenizer_file.readToEndAlloc(allocator, 128 * 1024 * 1024);
-    defer allocator.free(json_bytes);
-
+pub fn init(allocator: std.mem.Allocator, json_bytes: []const u8) !@This() {
     const parsed: Parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
@@ -75,14 +72,14 @@ pub fn init(allocator: std.mem.Allocator, tokenizer_file: std.fs.File) !@This() 
     errdefer if (unknown_token) |unk| allocator.free(unk);
 
     // Build merge pair index: "left\x00right" -> merge_idx
-    var merge_index: MergePairIndex = .{};
+    var merge_index: MergePairIndex = .empty;
     errdefer {
         var merge_it = merge_index.iterator();
         while (merge_it.next()) |entry| allocator.free(entry.key_ptr.*);
         merge_index.deinit(allocator);
     }
 
-    var key_buf: std.ArrayListUnmanaged(u8) = .{};
+    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer key_buf.deinit(allocator);
 
     const merges = try getArray(model, "merges");
@@ -298,7 +295,7 @@ fn readPostProcessorValue(
     const post_type = try getString(v_post, "type");
 
     if (std.ascii.eqlIgnoreCase("Sequence", post_type)) {
-        var result: std.ArrayListUnmanaged(PostProcessor) = .{};
+        var result: std.ArrayListUnmanaged(PostProcessor) = .empty;
         defer result.deinit(allocator);
 
         const processors = try getArray(v_post, "processors");
@@ -310,7 +307,7 @@ fn readPostProcessorValue(
 
         return .{ .sequence = try result.toOwnedSlice(allocator) };
     } else if (std.ascii.eqlIgnoreCase("TemplateProcessing", post_type)) {
-        var template: std.ArrayListUnmanaged(PostProcessor.TemplateProcessing) = .{};
+        var template: std.ArrayListUnmanaged(PostProcessor.TemplateProcessing) = .empty;
         defer template.deinit(allocator);
 
         const single = try getArray(v_post, "single");
@@ -383,10 +380,16 @@ fn freePostProcessor(allocator: std.mem.Allocator, post_processor: PostProcessor
 }
 
 test "load tokenizer.json and verify vocabulary" {
-    const tokenizer_file = try std.fs.cwd().openFile("test_models/TinyStories-656K/tokenizer.json", .{});
-    defer tokenizer_file.close();
+    const io = testing.io;
+    const json_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "test_models/TinyStories-656K/tokenizer.json",
+        testing.allocator,
+        .limited(128 * 1024 * 1024),
+    );
+    defer testing.allocator.free(json_bytes);
 
-    var tokenizer = try init(testing.allocator, tokenizer_file);
+    var tokenizer = try init(testing.allocator, json_bytes);
     defer tokenizer.deinit();
 
     try testing.expectEqual(26, tokenizer.encoding.get("A").?);

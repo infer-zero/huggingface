@@ -1,11 +1,13 @@
+io: std.Io,
 allocator: std.mem.Allocator,
 metadata: MetadataIndex,
-model_dir: std.fs.Dir,
+model_dir: std.Io.Dir,
 
 pub const MetadataIndex = std.StringArrayHashMapUnmanaged(Metadata);
 
-pub fn init(allocator: std.mem.Allocator, model_dir: std.fs.Dir) !@This() {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, model_dir: std.Io.Dir) !@This() {
     var self: @This() = .{
+        .io = io,
         .allocator = allocator,
         .metadata = .empty,
         .model_dir = model_dir,
@@ -14,17 +16,14 @@ pub fn init(allocator: std.mem.Allocator, model_dir: std.fs.Dir) !@This() {
 
     // iterate over all .safetensors files
     var dir_iter = model_dir.iterate();
-    while (try dir_iter.next()) |file_entry| {
+    while (try dir_iter.next(io)) |file_entry| {
         const ext = std.fs.path.extension(file_entry.name);
         if (std.mem.eql(u8, ".safetensors", ext)) {
-            const file = try model_dir.openFile(file_entry.name, .{});
-            defer {
-                file.seekTo(0) catch unreachable;
-                file.close();
-            }
+            const file = try model_dir.openFile(io, file_entry.name, .{});
+            defer file.close(io);
 
             var buffer: [1024]u8 = undefined;
-            var file_reader = file.reader(&buffer);
+            var file_reader = file.reader(io, &buffer);
             const reader = &file_reader.interface;
 
             const metadata = try readMetadata(allocator, file_entry.name, reader);
@@ -156,14 +155,14 @@ pub const RawTensor = struct {
 pub fn getTensorRaw(self: *@This(), name: []const u8) !?RawTensor {
     const meta = self.metadata.get(name) orelse return null;
 
-    const file = self.model_dir.openFile(meta.file, .{}) catch {
+    const file = self.model_dir.openFile(self.io, meta.file, .{}) catch {
         log.err("safetensors: failed to open '{s}' for tensor '{s}'", .{ meta.file, name });
         return error.IOError;
     };
-    defer file.close();
+    defer file.close(self.io);
 
     var buffer: [4 * 1024]u8 = undefined;
-    var file_reader = file.reader(&buffer);
+    var file_reader = file.reader(self.io, &buffer);
     const reader = &file_reader.interface;
 
     _ = reader.discard(.limited(meta.offset)) catch {
@@ -183,22 +182,24 @@ pub fn getTensorRaw(self: *@This(), name: []const u8) !?RawTensor {
 }
 
 test "init loads safetensors metadata" {
+    const io = testing.io;
     const path = "test_models/TinyStories-656K";
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
 
-    var sf = try init(testing.allocator, dir);
+    var sf = try init(io, testing.allocator, dir);
     defer sf.deinit();
 
     try testing.expect(sf.metadata.count() > 0);
 }
 
 test "getTensorRaw loads embeddings" {
+    const io = testing.io;
     const path = "test_models/TinyStories-656K";
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
 
-    var sf = try init(testing.allocator, dir);
+    var sf = try init(io, testing.allocator, dir);
     defer sf.deinit();
 
     const embeddings = try sf.getTensorRaw("model.embed_tokens.weight");
@@ -212,11 +213,12 @@ test "getTensorRaw loads embeddings" {
 }
 
 test "getTensorRaw returns null for missing tensor" {
+    const io = testing.io;
     const path = "test_models/TinyStories-656K";
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
 
-    var sf = try init(testing.allocator, dir);
+    var sf = try init(io, testing.allocator, dir);
     defer sf.deinit();
 
     const missing = try sf.getTensorRaw("nonexistent.weight");

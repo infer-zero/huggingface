@@ -19,8 +19,9 @@
 
 const Self = @This();
 
+io: std.Io,
 allocator: std.mem.Allocator,
-dir: std.fs.Dir,
+dir: std.Io.Dir,
 parsed_config: Parsed,
 config: std.json.ObjectMap,
 tokenizer: HfTokenizer,
@@ -29,29 +30,30 @@ safetensors: Safetensors,
 const Parsed = std.json.Parsed(std.json.Value);
 
 const max_config_bytes = 10 * 1024 * 1024;
+const max_tokenizer_bytes = 128 * 1024 * 1024;
 
-pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    errdefer dir.close();
+pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Self {
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    errdefer dir.close(io);
 
-    var config_file = try dir.openFile("config.json", .{});
-    const json_bytes = try config_file.readToEndAlloc(allocator, max_config_bytes);
-    config_file.close();
+    const json_bytes = try dir.readFileAlloc(io, "config.json", allocator, .limited(max_config_bytes));
     defer allocator.free(json_bytes);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
 
-    var tokenizer_file = try dir.openFile("tokenizer.json", .{});
-    var tokenizer = try HfTokenizer.init(allocator, tokenizer_file);
-    tokenizer_file.close();
+    const tokenizer_bytes = try dir.readFileAlloc(io, "tokenizer.json", allocator, .limited(max_tokenizer_bytes));
+    defer allocator.free(tokenizer_bytes);
+
+    var tokenizer = try HfTokenizer.init(allocator, tokenizer_bytes);
     errdefer tokenizer.deinit();
 
-    var safetensors = try Safetensors.init(allocator, dir);
+    var safetensors = try Safetensors.init(io, allocator, dir);
     errdefer safetensors.deinit();
 
     return .{
+        .io = io,
         .allocator = allocator,
         .dir = dir,
         .parsed_config = parsed,
@@ -65,11 +67,12 @@ pub fn deinit(self: *Self) void {
     self.safetensors.deinit();
     self.tokenizer.deinit();
     self.parsed_config.deinit();
-    self.dir.close();
+    self.dir.close(self.io);
 }
 
 test "Parser loads config, tokenizer, safetensors from test model" {
-    var parser = try init(testing.allocator, "test_models/TinyStories-656K");
+    const io = testing.io;
+    var parser = try init(io, testing.allocator, "test_models/TinyStories-656K");
     defer parser.deinit();
 
     try testing.expectEqual(@as(usize, 2), json_config.getUint(parser.config, "num_hidden_layers").?);
@@ -82,7 +85,8 @@ test "Parser loads config, tokenizer, safetensors from test model" {
 }
 
 test "Parser errors on missing config.json" {
-    const result = init(testing.allocator, "test_models");
+    const io = testing.io;
+    const result = init(io, testing.allocator, "test_models");
     try testing.expectError(error.FileNotFound, result);
 }
 
