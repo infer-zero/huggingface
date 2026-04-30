@@ -79,7 +79,7 @@ pub fn init(allocator: std.mem.Allocator, json_bytes: []const u8) !@This() {
         merge_index.deinit(allocator);
     }
 
-    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+    var key_buf: std.ArrayList(u8) = .empty;
     defer key_buf.deinit(allocator);
 
     const merges = try getArray(model, "merges");
@@ -295,7 +295,7 @@ fn readPostProcessorValue(
     const post_type = try getString(v_post, "type");
 
     if (std.ascii.eqlIgnoreCase("Sequence", post_type)) {
-        var result: std.ArrayListUnmanaged(PostProcessor) = .empty;
+        var result: std.ArrayList(PostProcessor) = .empty;
         defer result.deinit(allocator);
 
         const processors = try getArray(v_post, "processors");
@@ -307,7 +307,7 @@ fn readPostProcessorValue(
 
         return .{ .sequence = try result.toOwnedSlice(allocator) };
     } else if (std.ascii.eqlIgnoreCase("TemplateProcessing", post_type)) {
-        var template: std.ArrayListUnmanaged(PostProcessor.TemplateProcessing) = .empty;
+        var template: std.ArrayList(PostProcessor.TemplateProcessing) = .empty;
         defer template.deinit(allocator);
 
         const single = try getArray(v_post, "single");
